@@ -731,9 +731,13 @@ def github_request(
     )
     if body is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GitHub {method} {url} -> HTTP {exc.code}: {detail}") from exc
 
 
 def normalize_github_url(url: str) -> str:
@@ -790,6 +794,62 @@ def ensure_omni_model_pr(
     except Exception as exc:
         print(f"Could not open Omni git PR on {repo}: {exc}")
         return raw or None
+
+
+def git_sync_shared() -> dict[str, Any]:
+    payload = omni_request(
+        "POST",
+        f"/api/v1/models/{model_id()}/git/sync",
+        {},
+    )
+    print(f"Omni git sync: {payload}")
+    return payload if isinstance(payload, dict) else {}
+
+
+def merge_omni_github_pr(git_branch: str) -> str | None:
+    token = github_write_token()
+    repo = omni_git_repo()
+    if not token:
+        print("No OMNI_GIT_TOKEN/GITHUB_TOKEN; skip merging Omni git PR")
+        return None
+    owner = repo.split("/")[0]
+    existing = github_request(
+        "GET",
+        f"https://api.github.com/repos/{repo}/pulls"
+        f"?head={urllib.parse.quote(owner + ':' + git_branch)}&state=open",
+        token=token,
+    )
+    if not isinstance(existing, list) or not existing:
+        print(f"No open Omni git PR for {git_branch}")
+        return None
+    number = existing[0].get("number")
+    html = existing[0].get("html_url")
+    github_request(
+        "PUT",
+        f"https://api.github.com/repos/{repo}/pulls/{number}/merge",
+        {
+            "merge_method": "merge",
+            "commit_title": f"Merge Omni model updates from {git_branch}",
+        },
+        token=token,
+    )
+    print(f"Merged Omni git PR {html}")
+    return html
+
+
+def merge_omni_model_branch(git_branch: str) -> dict[str, Any]:
+    encoded = urllib.parse.quote(git_branch, safe="")
+    payload = omni_request(
+        "POST",
+        f"/api/v1/models/{model_id()}/branch/{encoded}/merge",
+        {
+            "force_override_git_settings": True,
+            "delete_branch": False,
+            "commit_message": f"Promote Omni branch {git_branch} after dbt prod",
+        },
+    )
+    print(f"Omni branch merge: {payload}")
+    return payload if isinstance(payload, dict) else {}
 
 
 def comment_on_pr(pr_number: int, markdown: str) -> None:
@@ -928,14 +988,6 @@ def cleanup(pr_number: int, git_branch: str) -> None:
             refresh_schema(branch["id"])
         except Exception as exc:
             print(f"Schema refresh after retarget failed: {exc}")
-        try:
-            commit = commit_branch_to_git(
-                branch["id"],
-                f"Retarget Omni views to {prod_schema()} after dbt PR #{pr_number} merged",
-            )
-            ensure_omni_model_pr(git_branch, pr_number, commit)
-        except Exception as exc:
-            print(f"Omni git commit after retarget failed: {exc}")
     else:
         print(f"No Omni branch named {git_branch}; skip retarget")
     schema = pr_schema(pr_number)
@@ -951,8 +1003,8 @@ def cleanup(pr_number: int, git_branch: str) -> None:
     else:
         print(f"No Omni dbt env named {name}")
     print(
-        f"Left Omni model branch `{git_branch}` in place so YAML/content PRs on "
-        "omni_test_env can still be merged."
+        f"Left Omni model branch `{git_branch}` in place. Prod refresh merges the "
+        "omni_test_env PR and git-syncs the shared model."
     )
 
 
@@ -964,14 +1016,34 @@ def refresh_prod(git_branch: str = "") -> None:
             raise RuntimeError(f"No Omni branch named {git_branch} to refresh")
         branch_id = branch["id"]
         align_views_to_schema(prod_schema(), branch_id)
+        refresh_schema(branch_id)
         try:
             commit = commit_branch_to_git(
                 branch_id,
                 f"Point Omni views at {prod_schema()} after prod dbt build",
             )
+            print(f"Omni git commit: {commit}")
             ensure_omni_model_pr(git_branch, 0, commit)
         except Exception as exc:
             print(f"Omni git commit after prod refresh failed: {exc}")
+        try:
+            merge_omni_github_pr(git_branch)
+        except Exception as exc:
+            print(f"Merging Omni git PR failed: {exc}")
+        try:
+            git_sync_shared()
+        except Exception as exc:
+            print(f"Omni git sync failed: {exc}")
+        try:
+            merge_omni_model_branch(git_branch)
+        except Exception as exc:
+            print(f"Omni branch merge failed: {exc}")
+        try:
+            git_sync_shared()
+        except Exception as exc:
+            print(f"Omni git sync after promote failed: {exc}")
+        print("Production schema refresh completed")
+        return
     refresh_schema(branch_id)
     print("Production schema refresh completed")
 
