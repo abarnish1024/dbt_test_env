@@ -1,0 +1,36 @@
+name: dbt prod + Omni refresh
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  prod:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+      MOTHERDUCK_DATABASE: my_db
+      DBT_PROFILES_DIR: .
+      OMNI_BASE_URL: ${{ vars.OMNI_BASE_URL || 'https://andrewbarnish.omniapp.co' }}
+      OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
+      OMNI_CONNECTION_ID: ${{ vars.OMNI_CONNECTION_ID || '51e3303e-1e8a-4752-82f9-419eed9b4cba' }}
+      OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID || 'aa9824df-0ccd-4a92-8954-d56203363e48' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dbt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: dbt build (prod / main schema)
+        run: dbt build --target prod --profiles-dir .
+
+      - name: Refresh Omni shared model
+        run: python scripts/omni_preview.py refresh-prod

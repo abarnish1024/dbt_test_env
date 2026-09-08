@@ -1,0 +1,13 @@
+barnish:
+  target: prod
+  outputs:
+    prod:
+      type: duckdb
+      path: "md:{{ env_var('MOTHERDUCK_DATABASE', 'my_db') }}"
+      schema: main
+      threads: 4
+    ci:
+      type: duckdb
+      path: "md:{{ env_var('MOTHERDUCK_DATABASE', 'my_db') }}"
+      schema: "{{ env_var('DBT_SCHEMA') }}"
+      threads: 4

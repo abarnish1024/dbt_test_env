@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: stg_races
+    description: Cleaned race calendar from source f1.races
+    columns:
+      - name: race_id
+        tests: [not_null, unique]
+  - name: stg_drivers
+    description: Cleaned driver attributes
+    columns:
+      - name: driver_id
+        tests: [not_null, unique]
+  - name: stg_results
+    description: Cleaned race results. `points` is the field to rename in a demo PR.
+    columns:
+      - name: result_id
+        tests: [not_null, unique]
+      - name: points
+        description: Championship points awarded for this result. Rename this column in a PR to demonstrate Omni content-validator blast radius.

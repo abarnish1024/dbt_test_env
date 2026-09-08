@@ -1,0 +1,21 @@
+name: dbt_test_env
+version: "1.0.0"
+config-version: 2
+
+profile: barnish
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - target
+  - dbt_packages
+  - logs
+
+models:
+  dbt_test_env:
+    +materialized: view
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: f1
+    description: Formula 1 tables already loaded in MotherDuck my_db.main
+    schema: main
+    tables:
+      - name: races
+        description: Race calendar
+      - name: drivers
+        description: Driver dimension
+      - name: results
+        description: Race finishing results and points

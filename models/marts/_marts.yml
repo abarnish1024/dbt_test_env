@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: dim_drivers
+    description: One row per driver
+    columns:
+      - name: driver_id
+        tests: [not_null, unique]
+      - name: driver_name
+        description: Display name. Rename this in a dbt PR to show Omni downstream impact.
+  - name: fct_race_results
+    description: Race results joined to race and driver attributes. `points` is the demo rename/deprecation field.
+    columns:
+      - name: result_id
+        tests: [not_null, unique]
+      - name: points
+        description: Championship points for the result. Rename to race_points in a feature PR to demonstrate Omni Content Validator blast radius.
+      - name: race_name
+        tests: [not_null]
