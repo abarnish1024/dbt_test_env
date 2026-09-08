@@ -18,6 +18,7 @@ jobs:
       OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
       OMNI_CONNECTION_ID: ${{ vars.OMNI_CONNECTION_ID || '51e3303e-1e8a-4752-82f9-419eed9b4cba' }}
       OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID || 'aa9824df-0ccd-4a92-8954-d56203363e48' }}
+      OMNI_GIT_TOKEN: ${{ secrets.OMNI_GIT_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
