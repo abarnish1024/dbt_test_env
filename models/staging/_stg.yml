@@ -17,4 +17,4 @@ models:
       - name: result_id
         tests: [not_null, unique]
       - name: points
-        description: Championship points awarded for this result. Rename this column in a PR to demonstrate Omni content-validator blast radius.
+        description: Championship points awarded for this result. The mart exposes this as `race_points`.
