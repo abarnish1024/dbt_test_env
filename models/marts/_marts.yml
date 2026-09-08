@@ -13,7 +13,7 @@ models:
     columns:
       - name: result_id
         tests: [not_null, unique]
-      - name: race_points_collected
+      - name: points_collected_in_race
         description: Championship points for the result. Renamed from `points` so Omni Content Validator can show downstream blast radius.
       - name: race_name
         tests: [not_null]
