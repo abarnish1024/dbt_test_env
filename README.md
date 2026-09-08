@@ -5,9 +5,10 @@ This repo is the **dbt Core** side of a tandem GitHub + Omni workflow:
 1. Open a dbt PR.
 2. CI builds models into a temporary MotherDuck schema (`dbt_pr_<PR>`).
 3. CI creates a matching Omni dbt environment and Omni model **branch**.
-4. You log into Omni, open that branch, and use Content Validator to see downstream BI impact.
-5. Omni YAML/content fixes go out as a **second PR** on [`abarnish1024/omni_test_env`](https://github.com/abarnish1024/omni_test_env) with the **same branch name**.
-6. Merge dbt first, then Omni, so dashboards never go dark.
+4. CI rewrites the Omni branch views onto `dbt_pr_<PR>` (Omni's dbt-sync still compiles against `main`, so a schema refresh alone does not rename columns).
+5. Content Validator runs. The PR comment lists broken dashboards.
+6. Optional: add the **`omni-autofix`** label. CI find/replaces 1:1 renamed fields on the Omni branch and opens/updates a PR on [`omni_test_env`](https://github.com/abarnish1024/omni_test_env).
+7. Merge dbt first, then Omni, so dashboards never go dark.
 
 Warehouse: MotherDuck `my_db` via Omni connection **Barnish Duck**.
 
@@ -40,7 +41,7 @@ CI-style local preview (does not comment on GitHub):
 ```bash
 export DBT_SCHEMA=dbt_pr_local
 dbt build --target ci --profiles-dir .
-python scripts/omni_preview.py preview --pr-number 0 --git-branch "$(git branch --show-current)"
+python scripts/omni_preview.py preview --pr-number 0 --git-branch "$(git branch --show-current)" --autofix
 ```
 
 Requires Python 3.12+, `dbt-core`, and `dbt-duckdb` (see `requirements.txt`).
@@ -67,6 +68,7 @@ On **this** repo (`dbt_test_env`) → Settings → Secrets and variables → Act
 | --- | --- |
 | `OMNI_API_KEY` | Organization API key from Omni (Settings → API Keys) |
 | `MOTHERDUCK_TOKEN` | MotherDuck read/write PAT |
+| `OMNI_GIT_TOKEN` | Optional GitHub PAT that can open PRs on `omni_test_env`. Needed for auto-heal: Omni can push the branch (deploy key) but GitHub Actions `GITHUB_TOKEN` cannot create PRs in the other repo. |
 
 **Variables** (optional; defaults are already in the workflows)
 
@@ -93,18 +95,30 @@ CI cannot attach GitHub to Omni. Do this in [andrewbarnish.omniapp.co](https://a
 
 Until those clicks are done, `scripts/omni_preview.py` will fail with `dbt not configured` / `Git not configured`.
 
+## Auto-heal (`omni-autofix`)
+
+Without the label, preview is **report-only**: the Omni branch shows the blast radius (broken `points` refs, etc.).
+
+Add the **`omni-autofix`** label to the dbt PR (or include it when you open the PR). That re-runs preview and:
+
+1. Diffs CI schema columns against prod `main`.
+2. Treats a 1:1 drop/add (or `old as new` in the dbt SQL) as a field rename.
+3. Find/replaces those fields on the Omni branch, including personal-folder dashboards.
+4. Commits the Omni model branch to git and opens/updates the `omni_test_env` PR.
+
+Grain or logic changes that are not a 1:1 rename are left for a human. Removing the label does not undo replacements.
+
 ## Tandem merge order
 
 Use the **same branch name** in both repos (for example `feat/rename-points`).
 
 1. Open the dbt PR. Wait for the Omni preview comment.
-2. Open the Omni branch from that comment. Run Content Validator. Fix references / model YAML.
-3. Omni syncs a PR on `omni_test_env`.
-4. **Merge the dbt PR.** `dbt-prod.yml` runs `dbt build --target prod` into `main` and refreshes the shared Omni model.
-5. **Merge the Omni PR** so dashboards pick up the new field names.
+2. To see blast radius, inspect the Omni branch / validator list. To auto-fix 1:1 renames, add `omni-autofix`.
+3. **Merge the dbt PR.** Prod `dbt build` writes `race_points` into `main`. Cleanup retargets the Omni branch off `dbt_pr_<N>` **before** dropping that schema.
+4. **Then merge the Omni PR** on `omni_test_env`. That PR should point at schema `main`, not `dbt_pr_*`.
 
 Do not merge the Omni PR before the warehouse and schema refresh have the new columns.
 
 ## Cleanup
 
-Closing or merging the dbt PR drops `dbt_pr_<N>` in MotherDuck and deletes Omni dbt env `ci-pr-<N>`. The Omni **model branch** is left in place so the Omni git PR can still merge.
+Closing or merging the dbt PR retargets Omni views to `main`, then drops `dbt_pr_<N>` and deletes Omni dbt env `ci-pr-<N>`. The Omni **model branch** is left in place so the Omni git PR can still merge.

@@ -2,7 +2,7 @@ name: Omni preview
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
   group: omni-preview-${{ github.event.pull_request.number }}
@@ -10,6 +10,9 @@ concurrency:
 
 jobs:
   preview:
+    if: >
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+      || github.event.label.name == 'omni-autofix'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,6 +27,8 @@ jobs:
       OMNI_CONNECTION_ID: ${{ vars.OMNI_CONNECTION_ID || '51e3303e-1e8a-4752-82f9-419eed9b4cba' }}
       OMNI_MODEL_ID: ${{ vars.OMNI_MODEL_ID || 'aa9824df-0ccd-4a92-8954-d56203363e48' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OMNI_GIT_TOKEN: ${{ secrets.OMNI_GIT_TOKEN }}
+      OMNI_AUTOFIX: ${{ contains(github.event.pull_request.labels.*.name, 'omni-autofix') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +46,11 @@ jobs:
 
       - name: Create Omni preview environment
         run: |
+          extra=""
+          if [ "${OMNI_AUTOFIX}" = "true" ]; then
+            extra="--autofix"
+          fi
           python scripts/omni_preview.py preview \
             --pr-number "${{ github.event.pull_request.number }}" \
-            --git-branch "${{ github.head_ref }}"
+            --git-branch "${{ github.head_ref }}" \
+            ${extra}
