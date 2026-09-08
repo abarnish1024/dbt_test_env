@@ -17,3 +17,5 @@ models:
         description: Championship points for the result. Renamed from `points` so Omni Content Validator can show downstream blast radius.
       - name: race_name
         tests: [not_null]
+      - name: race_laps
+        description: Number of laps completed in the race. Renamed from `laps` so Omni Content Validator can show downstream blast radius.
