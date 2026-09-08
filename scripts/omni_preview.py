@@ -327,8 +327,16 @@ def _dimension_block(name: str, body: Any) -> str:
     description = cfg.get("description")
     fmt = cfg.get("format")
     ignored = cfg.get("ignored")
-    if ignored is True:
+    sql = cfg.get("sql")
+    if ignored is True and not sql:
         return f"  {name}:\n    ignored: true\n"
+    if sql:
+        lines = [f"  {name}:\n", f"    sql: {sql}\n"]
+        if fmt:
+            lines.append(f"    format: {fmt}\n")
+        if description:
+            lines.append(f"    description: {_yaml_scalar(str(description))}\n")
+        return "".join(lines)
     if not description and not fmt:
         return f"  {name}: {{}}\n"
     lines = [f"  {name}:\n"]
@@ -382,15 +390,29 @@ def rewrite_view_for_ci(
             description = desc_match.group(1).strip().strip("\"'")
         measures = {}
     stale = [name for name in dim_names if name not in columns]
+    aliases = dbt_sql_aliases(table_match.group(1))
+    missing_aliases = [
+        (old, new)
+        for old, new in aliases.items()
+        if old not in columns and new in columns and old not in dim_names
+    ]
     already_ignored = {
         name
         for name in stale
         if isinstance(existing_dims.get(name), dict) and existing_dims[name].get("ignored") is True
     }
+    already_aliased = {
+        name
+        for name in stale
+        if isinstance(existing_dims.get(name), dict)
+        and existing_dims[name].get("sql")
+        and existing_dims[name].get("ignored") is not True
+    }
     if (
         current_schema == schema
         and set(columns).issubset(set(dim_names))
-        and set(stale) == already_ignored
+        and set(stale) <= (already_ignored | already_aliased)
+        and not missing_aliases
     ):
         return None
     if not measures:
@@ -404,8 +426,19 @@ def rewrite_view_for_ci(
     for column in columns:
         parts.append(_dimension_block(column, existing_dims.get(column)))
     for name in stale:
+        new = aliases.get(name)
+        if new and new in columns:
+            prior = existing_dims.get(name) if isinstance(existing_dims.get(name), dict) else {}
+            alias_cfg = {k: v for k, v in prior.items() if k != "ignored"}
+            alias_cfg["sql"] = f"${{{new}}}"
+            parts.append(_dimension_block(name, alias_cfg))
+            print(f"Aliasing stale Omni field {view_name}.{name} -> {new}")
+            continue
         parts.append(_dimension_block(name, {"ignored": True}))
         print(f"Ignoring stale Omni field {view_name}.{name} (not in CI table)")
+    for old, new in missing_aliases:
+        parts.append(_dimension_block(old, {"sql": f"${{{new}}}"}))
+        print(f"Restoring dropped Omni field {view_name}.{old} as alias of {new}")
     parts.append("\nmeasures:\n")
     for name, body in measures.items():
         cfg = body if isinstance(body, dict) else {}
@@ -518,11 +551,14 @@ def align_views_to_ci_schema(pr_number: int, branch_id: str) -> None:
     align_views_to_schema(pr_schema(pr_number), branch_id)
 
 
-def list_view_names(branch_id: str) -> dict[str, Any]:
+def list_view_names(branch_id: str | None = None) -> dict[str, Any]:
+    query: dict[str, str] = {}
+    if branch_id:
+        query["branchId"] = branch_id
     listing = omni_request(
         "GET",
         f"/api/v1/models/{model_id()}/yaml",
-        query={"branchId": branch_id},
+        query=query or None,
     )
     return listing.get("viewNames") or {}
 
@@ -589,19 +625,38 @@ def detect_field_renames(
     return renames
 
 
-def replace_field(branch_id: str, find: str, replacement: str) -> dict[str, Any]:
+def replace_field(branch_id: str | None, find: str, replacement: str) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "find": find,
+        "replacement": replacement,
+        "find_or_replace_type": "FIELD",
+        "include_personal_folders": True,
+    }
+    if branch_id:
+        body["branch_id"] = branch_id
     payload = omni_request(
         "POST",
         f"/api/v1/models/{model_id()}/content-validator",
-        {
-            "branch_id": branch_id,
-            "find": find,
-            "replacement": replacement,
-            "find_or_replace_type": "FIELD",
-            "include_personal_folders": True,
-        },
+        body,
     )
     return payload if isinstance(payload, dict) else {}
+
+
+def replace_prod_renames() -> None:
+    """Retarget published content from dropped dbt names onto the current columns."""
+    view_names = list_view_names()
+    prod = ci_table_columns(prod_schema())
+    for table, cols in prod.items():
+        if table not in dbt_model_tables():
+            continue
+        view = omni_view_name_for_table(view_names, table)
+        if not view:
+            continue
+        for old, new in dbt_sql_aliases(table).items():
+            if old == new or new not in cols or old in cols:
+                continue
+            result = replace_field(None, f"{view}.{old}", f"{view}.{new}")
+            print(f"Published replace {view}.{old} -> {view}.{new}: {result}")
 
 
 def commit_branch_to_git(branch_id: str, commit_message: str) -> dict[str, Any]:
@@ -838,6 +893,12 @@ def merge_omni_github_pr(git_branch: str) -> str | None:
 
 
 def merge_omni_model_branch(git_branch: str) -> dict[str, Any]:
+    branch = find_branch(git_branch)
+    if not branch:
+        print(f"No Omni branch named {git_branch}; skip Omni branch merge")
+        return {}
+    # Encode slashes so feat/foo is one path segment. The merge API wants the
+    # branch name, not the branch UUID.
     encoded = urllib.parse.quote(git_branch, safe="")
     payload = omni_request(
         "POST",
@@ -848,7 +909,7 @@ def merge_omni_model_branch(git_branch: str) -> dict[str, Any]:
             "commit_message": f"Promote Omni branch {git_branch} after dbt prod",
         },
     )
-    print(f"Omni branch merge: {payload}")
+    print(f"Omni branch merge ({git_branch}): {payload}")
     return payload if isinstance(payload, dict) else {}
 
 
@@ -1042,9 +1103,17 @@ def refresh_prod(git_branch: str = "") -> None:
             git_sync_shared()
         except Exception as exc:
             print(f"Omni git sync after promote failed: {exc}")
+        try:
+            replace_prod_renames()
+        except Exception as exc:
+            print(f"Published field replace failed: {exc}")
         print("Production schema refresh completed")
         return
     refresh_schema(branch_id)
+    try:
+        replace_prod_renames()
+    except Exception as exc:
+        print(f"Published field replace failed: {exc}")
     print("Production schema refresh completed")
 
 
