@@ -9,12 +9,12 @@ models:
       - name: driver_name
         description: Display name. Rename this in a dbt PR to show Omni downstream impact.
   - name: fct_race_results
-    description: Race results joined to race and driver attributes. `race_points` is championship points (renamed from `points`).
+    description: Race results joined to race and driver attributes. `championship_points` is championship points (renamed from `points_collected_total`).
     columns:
       - name: result_id
         tests: [not_null, unique]
-      - name: points_collected_total
-        description: Championship points for the result. Renamed from `points` so Omni Content Validator can show downstream blast radius.
+      - name: championship_points
+        description: Championship points for the result. Renamed from `points_collected_total` so Omni Content Validator can show downstream blast radius.
       - name: race_name
         tests: [not_null]
       - name: race_laps
