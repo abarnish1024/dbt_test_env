@@ -35,13 +35,27 @@ jobs:
         run: dbt build --target prod --profiles-dir .
 
       - name: Refresh Omni model
+        id: omni
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[0].head.ref // empty' || true)"
-          if [ -n "$BRANCH" ]; then
+          PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" || echo '[]')"
+          BRANCH="$(printf '%s' "$PR_JSON" | jq -r '.[0].head.ref // empty')"
+          PR="$(printf '%s' "$PR_JSON" | jq -r '.[0].number // empty')"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR" ]; then
+            python scripts/omni_preview.py refresh-prod --git-branch "$BRANCH" --pr-number "$PR"
+          elif [ -n "$BRANCH" ]; then
             python scripts/omni_preview.py refresh-prod --git-branch "$BRANCH"
           else
             echo "No merged PR branch found; refresh-prod needs an Omni branch when branch-based refresh is on"
             python scripts/omni_preview.py refresh-prod
           fi
+
+      - name: Drop CI schema and Omni dbt env
+        if: success() && steps.omni.outputs.pr != ''
+        run: |
+          python scripts/omni_preview.py cleanup \
+            --pr-number "${{ steps.omni.outputs.pr }}" \
+            --git-branch "${{ steps.omni.outputs.branch }}"

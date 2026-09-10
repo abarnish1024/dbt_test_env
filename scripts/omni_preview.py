@@ -2,22 +2,27 @@
 """Create or tear down a per-PR Omni preview environment for dbt changes.
 
 preview:
-  1. Create/reuse a shared Omni dbt environment pointed at schema dbt_pr_<N>
-  2. Create/reuse an Omni model branch named after the git branch
-  3. Point that branch at the dbt env + dbt git branch
-  4. dbt-sync + schema-refresh the Omni branch
-  5. Rewrite dbt views so they query dbt_pr_<N> and the PR's columns
-  6. Run the content validator (including personal folders)
-  7. If --autofix (PR label omni-autofix): find/replace 1:1 column
-     renames on the Omni branch and git-commit an Omni PR
-  8. Comment on the GitHub PR (when GITHUB_TOKEN is set)
+  1. Create/reuse Omni dbt env ci-pr-<N> (schema dbt_pr_<N>)
+  2. Create a fresh Omni model branch named pr-<N> (not the dbt git branch)
+  3. Point that branch at the CI dbt env
+  4. Hard-refresh first (so the schema model sees dbt_pr_<N>), then dbt-sync
+  5. Rewrite physical main__ views onto dbt_pr_<N> for preview only
+  6. Content validator; optional autofix field replace
+  7. Before any git/commit: rewrite views back to schema main, point at the
+     production dbt env, hard-refresh, then Omni git/commit
+  8. Point the live branch back at ci-pr-<N> and rewrite again for preview
+
+Dashboards use physical main__ views, so the rewrite stays. Never commit while
+a view has schema: dbt_pr_N.
 
 cleanup:
-  Drop MotherDuck schema dbt_pr_<N> and delete the Omni dbt environment.
-  Leaves the Omni model branch / git PR so you can still merge YAML fixes.
+  After refresh-prod on merge (or immediately on abandoned PRs): drop
+  dbt_pr_<N> and delete ci-pr-<N>. Do not race refresh-prod.
 
 refresh-prod:
-  Schema-refresh the shared model (no branch) after dbt prod has landed.
+  Prod dbt build, then: rewrite views to main, prod dbt env, hard-refresh,
+  git/commit, merge Omni git PR, merge Omni branch with delete_branch=true.
+  Do not call /git/sync.
 """
 from __future__ import annotations
 
@@ -91,6 +96,11 @@ def prod_schema() -> str:
 
 def env_name(pr_number: int) -> str:
     return f"ci-pr-{pr_number}"
+
+
+def omni_branch_name(pr_number: int) -> str:
+    """Unique Omni model/git branch per dbt PR. Reusing feat/foo across PRs flip-flops git."""
+    return f"pr-{pr_number}"
 
 
 def omni_request(
@@ -235,17 +245,94 @@ def create_or_update_dbt_env(pr_number: int) -> dict[str, Any]:
     return created
 
 
-def set_branch_dbt(git_branch: str, dbt_environment_id: str) -> None:
+def dbt_prod_git_branch() -> str:
+    return env("OMNI_DBT_GIT_BRANCH") or env("OMNI_GIT_BASE", "main")
+
+
+def set_branch_dbt(
+    git_branch: str,
+    dbt_environment_id: str,
+    dbt_git_branch: str | None = None,
+) -> None:
+    dbt_ref = dbt_git_branch or git_branch
     encoded = urllib.parse.quote(git_branch, safe="")
     omni_request(
         "POST",
         f"/api/v1/models/{model_id()}/branch/{encoded}/dbt",
         {
             "dbt_environment_id": dbt_environment_id,
-            "dbt_git_branch": git_branch,
+            "dbt_git_branch": dbt_ref,
         },
     )
-    print(f"Pointed Omni branch {git_branch} at dbt env {dbt_environment_id} / git {git_branch}")
+    print(
+        f"Pointed Omni branch {git_branch} at dbt env {dbt_environment_id} "
+        f"/ dbt git {dbt_ref}"
+    )
+
+
+def find_prod_dbt_environment() -> dict[str, Any]:
+    envs = list_dbt_environments()
+    wanted_id = env("OMNI_PROD_DBT_ENV_ID")
+    if wanted_id:
+        match = next((item for item in envs if item.get("id") == wanted_id), None)
+        if match:
+            return match
+        raise RuntimeError(f"No Omni dbt environment with id {wanted_id}")
+    wanted_name = env("OMNI_PROD_DBT_ENV_NAME", "Production")
+    named = next((item for item in envs if (item.get("name") or "") == wanted_name), None)
+    if named:
+        return named
+    for item in envs:
+        if item.get("isDefault") or item.get("is_default") or item.get("default"):
+            return item
+    schema = prod_schema()
+    for item in envs:
+        name = item.get("name") or ""
+        if name.startswith("ci-pr-"):
+            continue
+        target = item.get("targetSchema") or item.get("target_schema")
+        if target == schema:
+            return item
+    raise RuntimeError(
+        "Could not find the production Omni dbt environment. Set "
+        "OMNI_PROD_DBT_ENV_ID or OMNI_PROD_DBT_ENV_NAME."
+    )
+
+
+def point_branch_at_prod_dbt(git_branch: str) -> dict[str, Any]:
+    prod = find_prod_dbt_environment()
+    env_id = prod.get("id")
+    if not env_id:
+        raise RuntimeError(f"Production dbt environment missing id: {prod}")
+    set_branch_dbt(git_branch, env_id, dbt_prod_git_branch())
+    return prod
+
+
+def point_branch_at_ci_dbt(pr_number: int, omni_branch: str, dbt_git_branch: str) -> None:
+    name = env_name(pr_number)
+    existing = next((item for item in list_dbt_environments() if item.get("name") == name), None)
+    if not existing or not existing.get("id"):
+        raise RuntimeError(f"No Omni dbt env named {name}")
+    set_branch_dbt(omni_branch, existing["id"], dbt_git_branch)
+
+
+def prepare_branch_for_preview(pr_number: int, omni_branch: str, branch_id: str, dbt_git_branch: str) -> None:
+    """Hard-refresh before dbt-sync so the new CI schema exists in the schema model."""
+    point_branch_at_ci_dbt(pr_number, omni_branch, dbt_git_branch)
+    refresh_schema(branch_id)
+    dbt_sync(branch_id)
+    align_views_to_ci_schema(pr_number, branch_id)
+
+
+def commit_branch_from_prod(omni_branch: str, branch_id: str, message: str) -> dict[str, Any]:
+    """Rewrite views off dbt_pr_N, use the default dbt env, hard-refresh, git/commit."""
+    align_views_to_schema(prod_schema(), branch_id)
+    prod = point_branch_at_prod_dbt(omni_branch)
+    print(f"Using production dbt env {prod.get('name')} ({prod.get('id')}) for git commit")
+    refresh_schema(branch_id)
+    commit = commit_branch_to_git(branch_id, message)
+    print(f"Omni git commit: {commit}")
+    return commit
 
 
 def poll_job(job_id: str, timeout_s: int = 600, label: str = "Omni job") -> None:
@@ -293,12 +380,12 @@ def dbt_sync(branch_id: str) -> None:
 def ci_table_columns(schema: str) -> dict[str, list[str]]:
     token = env("MOTHERDUCK_TOKEN")
     if not token:
-        print("MOTHERDUCK_TOKEN not set; skip aligning Omni views to CI schema")
+        print("MOTHERDUCK_TOKEN not set; skip warehouse column diff")
         return {}
     try:
         import duckdb
     except ImportError:
-        print("duckdb not installed; skip aligning Omni views to CI schema")
+        print("duckdb not installed; skip warehouse column diff")
         return {}
     con = duckdb.connect(f"md:{md_database()}?motherduck_token={token}")
     rows = con.execute(
@@ -315,6 +402,9 @@ def ci_table_columns(schema: str) -> dict[str, list[str]]:
         tables.setdefault(str(table_name), []).append(str(column_name))
     return tables
 
+
+def dbt_model_tables() -> set[str]:
+    return {path.stem for path in (ROOT / "models").rglob("*.sql")}
 
 def _yaml_scalar(value: str) -> str:
     if value == "" or any(ch in value for ch in ":#{}[]&*?|>!%@`'\"\n"):
@@ -450,10 +540,6 @@ def rewrite_view_for_ci(
     return "".join(parts)
 
 
-def dbt_model_tables() -> set[str]:
-    return {path.stem for path in (ROOT / "models").rglob("*.sql")}
-
-
 def align_views_to_schema(schema: str, branch_id: str | None) -> None:
     tables = {
         name: cols
@@ -549,6 +635,7 @@ def align_views_to_schema(schema: str, branch_id: str | None) -> None:
 
 def align_views_to_ci_schema(pr_number: int, branch_id: str) -> None:
     align_views_to_schema(pr_schema(pr_number), branch_id)
+
 
 
 def list_view_names(branch_id: str | None = None) -> dict[str, Any]:
@@ -672,7 +759,7 @@ def commit_branch_to_git(branch_id: str, commit_message: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def autofix_branch(pr_number: int, branch_id: str, git_branch: str) -> dict[str, Any]:
+def autofix_branch(pr_number: int, branch_id: str, omni_branch: str, git_branch: str) -> dict[str, Any]:
     view_names = list_view_names(branch_id)
     replacements: list[dict[str, Any]] = []
     for view, old, new in detect_field_renames(pr_number, view_names):
@@ -694,21 +781,21 @@ def autofix_branch(pr_number: int, branch_id: str, git_branch: str) -> dict[str,
         )
     commit: dict[str, Any] = {}
     try:
-        # Git must not record schema dbt_pr_* — merging that after cleanup
-        # points production at a dropped schema.
-        align_views_to_schema(prod_schema(), branch_id)
-        commit = commit_branch_to_git(
+        commit = commit_branch_from_prod(
+            omni_branch,
             branch_id,
             f"Auto-heal Omni model for dbt PR #{pr_number} ({git_branch})",
         )
-        print(f"Omni git commit: {commit}")
-        pr_url = ensure_omni_model_pr(git_branch, pr_number, commit)
+        pr_url = ensure_omni_model_pr(omni_branch, pr_number, commit)
         if pr_url:
             commit["pr_url"] = pr_url
     except Exception as exc:
         print(f"Omni git commit failed: {exc}")
         commit = {"error": str(exc)}
-    align_views_to_ci_schema(pr_number, branch_id)
+    try:
+        prepare_branch_for_preview(pr_number, omni_branch, branch_id, git_branch)
+    except Exception as exc:
+        print(f"Could not point Omni branch back at CI dbt env: {exc}")
     return {"replacements": replacements, "commit": commit}
 
 
@@ -833,7 +920,11 @@ def ensure_omni_model_pr(
             "POST",
             f"https://api.github.com/repos/{repo}/pulls",
             {
-                "title": f"Omni auto-heal for dbt PR #{pr_number} ({git_branch})",
+                "title": (
+                    f"Omni model updates for dbt PR #{pr_number} ({git_branch})"
+                    if pr_number
+                    else f"Omni model updates from {git_branch}"
+                ),
                 "head": git_branch,
                 "base": env("OMNI_GIT_BASE", "main"),
                 "body": (
@@ -849,16 +940,6 @@ def ensure_omni_model_pr(
     except Exception as exc:
         print(f"Could not open Omni git PR on {repo}: {exc}")
         return raw or None
-
-
-def git_sync_shared() -> dict[str, Any]:
-    payload = omni_request(
-        "POST",
-        f"/api/v1/models/{model_id()}/git/sync",
-        {},
-    )
-    print(f"Omni git sync: {payload}")
-    return payload if isinstance(payload, dict) else {}
 
 
 def merge_omni_github_pr(git_branch: str) -> str | None:
@@ -905,7 +986,7 @@ def merge_omni_model_branch(git_branch: str) -> dict[str, Any]:
         f"/api/v1/models/{model_id()}/branch/{encoded}/merge",
         {
             "force_override_git_settings": True,
-            "delete_branch": False,
+            "delete_branch": True,
             "commit_message": f"Promote Omni branch {git_branch} after dbt prod",
         },
     )
@@ -944,17 +1025,15 @@ def preview(pr_number: int, git_branch: str, autofix: bool = False) -> None:
     dbt_env_id = dbt_env.get("id")
     if not dbt_env_id:
         raise RuntimeError(f"dbt environment response missing id: {dbt_env}")
-    branch = create_or_get_branch(git_branch)
+    omni_branch = omni_branch_name(pr_number)
+    branch = create_or_get_branch(omni_branch)
     branch_id = branch.get("id")
     if not branch_id:
         raise RuntimeError(f"Omni branch response missing id: {branch}")
-    set_branch_dbt(git_branch, dbt_env_id)
-    dbt_sync(branch_id)
-    refresh_schema(branch_id)
-    align_views_to_ci_schema(pr_number, branch_id)
+    prepare_branch_for_preview(pr_number, omni_branch, branch_id, git_branch)
     validator = content_validator(branch_id)
     broken_count, lines = summarize_validator(validator)
-    url = branch_url(branch, git_branch)
+    url = branch_url(branch, omni_branch)
     schema = pr_schema(pr_number)
     status = "no broken references" if broken_count == 0 else f"{broken_count} document(s) with issues"
     issue_block = "\n".join(lines[:40]) if lines else "_None_"
@@ -964,7 +1043,7 @@ def preview(pr_number: int, git_branch: str, autofix: bool = False) -> None:
         "on this Omni branch and open the Omni git PR._"
     )
     if autofix:
-        heal = autofix_branch(pr_number, branch_id, git_branch)
+        heal = autofix_branch(pr_number, branch_id, omni_branch, git_branch)
         replace_lines = []
         for item in heal.get("replacements") or []:
             docs = item.get("replaced_documents_count")
@@ -1008,7 +1087,7 @@ def preview(pr_number: int, git_branch: str, autofix: bool = False) -> None:
 
 Open this Omni branch to validate downstream BI impact before merge:
 
-- **Omni branch:** `{git_branch}`
+- **Omni branch:** `{omni_branch}` (dbt git `{git_branch}`)
 - **dbt environment:** `{env_name(pr_number)}` → schema `{schema}` / database `{md_database()}`
 - **Open in Omni:** {url}
 - **Content validator:** {status}
@@ -1019,8 +1098,8 @@ Open this Omni branch to validate downstream BI impact before merge:
 
 ### Tandem PRs
 
-1. Merge **this dbt PR first**, wait for prod `dbt build` + schema refresh.
-2. Merge the Omni PR on `omni_test_env` (same branch name `{git_branch}`).
+1. Merge **this dbt PR first**. Prod CI rewrites views off `dbt_pr_<N>`, points Omni branch `{omni_branch}` at the production dbt env, hard-refreshes, commits, merges the Omni git PR, then promotes and deletes that Omni branch.
+2. Do not merge the Omni git PR yourself, and do not call git/sync. Cleanup of `ci-pr-<N>` runs after that promote.
 """
     print(markdown)
     comment_on_pr(pr_number, markdown)
@@ -1041,16 +1120,15 @@ def drop_motherduck_schema(schema: str) -> None:
 
 
 def cleanup(pr_number: int, git_branch: str) -> None:
-    branch = find_branch(git_branch)
-    if branch and branch.get("id"):
-        print(f"Retargeting Omni branch {git_branch} to {prod_schema()} before dropping CI schema")
-        align_views_to_schema(prod_schema(), branch["id"])
+    omni_branch = omni_branch_name(pr_number)
+    branch = find_branch(omni_branch)
+    if branch:
         try:
-            refresh_schema(branch["id"])
+            point_branch_at_prod_dbt(omni_branch)
         except Exception as exc:
-            print(f"Schema refresh after retarget failed: {exc}")
+            print(f"Could not point Omni branch {omni_branch} at prod dbt env: {exc}")
     else:
-        print(f"No Omni branch named {git_branch}; skip retarget")
+        print(f"No Omni branch named {omni_branch}; skip dbt env retarget")
     schema = pr_schema(pr_number)
     drop_motherduck_schema(schema)
     name = env_name(pr_number)
@@ -1063,53 +1141,40 @@ def cleanup(pr_number: int, git_branch: str) -> None:
         print(f"Deleted Omni dbt env {name}")
     else:
         print(f"No Omni dbt env named {name}")
-    print(
-        f"Left Omni model branch `{git_branch}` in place. Prod refresh merges the "
-        "omni_test_env PR and git-syncs the shared model."
-    )
+    print(f"dbt git branch `{git_branch}`; Omni branch `{omni_branch}`")
 
 
-def refresh_prod(git_branch: str = "") -> None:
-    branch_id = None
-    if git_branch:
-        branch = find_branch(git_branch)
+def refresh_prod(git_branch: str = "", pr_number: int = 0) -> None:
+    omni_branch = omni_branch_name(pr_number) if pr_number else git_branch
+    if omni_branch:
+        branch = find_branch(omni_branch)
         if not branch or not branch.get("id"):
-            raise RuntimeError(f"No Omni branch named {git_branch} to refresh")
+            raise RuntimeError(f"No Omni branch named {omni_branch} to refresh")
         branch_id = branch["id"]
-        align_views_to_schema(prod_schema(), branch_id)
-        refresh_schema(branch_id)
         try:
-            commit = commit_branch_to_git(
+            commit = commit_branch_from_prod(
+                omni_branch,
                 branch_id,
-                f"Point Omni views at {prod_schema()} after prod dbt build",
+                f"Refresh Omni branch {omni_branch} after prod dbt build",
             )
-            print(f"Omni git commit: {commit}")
-            ensure_omni_model_pr(git_branch, 0, commit)
+            ensure_omni_model_pr(omni_branch, pr_number, commit)
         except Exception as exc:
             print(f"Omni git commit after prod refresh failed: {exc}")
         try:
-            merge_omni_github_pr(git_branch)
+            merge_omni_github_pr(omni_branch)
         except Exception as exc:
             print(f"Merging Omni git PR failed: {exc}")
         try:
-            git_sync_shared()
-        except Exception as exc:
-            print(f"Omni git sync failed: {exc}")
-        try:
-            merge_omni_model_branch(git_branch)
+            merge_omni_model_branch(omni_branch)
         except Exception as exc:
             print(f"Omni branch merge failed: {exc}")
-        try:
-            git_sync_shared()
-        except Exception as exc:
-            print(f"Omni git sync after promote failed: {exc}")
         try:
             replace_prod_renames()
         except Exception as exc:
             print(f"Published field replace failed: {exc}")
         print("Production schema refresh completed")
         return
-    refresh_schema(branch_id)
+    refresh_schema(None)
     try:
         replace_prod_renames()
     except Exception as exc:
@@ -1135,7 +1200,13 @@ def parse_args() -> argparse.Namespace:
     refresh_cmd.add_argument(
         "--git-branch",
         default="",
-        help="Omni branch to refresh (required when branch-based schema refresh is on)",
+        help="dbt git branch (informational; Omni branch is pr-<N>)",
+    )
+    refresh_cmd.add_argument(
+        "--pr-number",
+        type=int,
+        default=0,
+        help="Merged dbt PR number; Omni branch is pr-<N>",
     )
     return parser.parse_args()
 
@@ -1148,7 +1219,7 @@ def main() -> None:
     elif args.command == "cleanup":
         cleanup(args.pr_number, args.git_branch)
     elif args.command == "refresh-prod":
-        refresh_prod(git_branch=args.git_branch)
+        refresh_prod(git_branch=args.git_branch, pr_number=args.pr_number)
     else:
         raise SystemExit(f"Unknown command {args.command}")
 
