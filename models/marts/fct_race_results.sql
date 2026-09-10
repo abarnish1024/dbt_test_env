@@ -9,7 +9,7 @@ select
   drivers.nationality as driver_nationality,
   results.grid,
   results.finish_position,
-  results.points as points_collected_total,
+  results.points as championship_points,
   results.laps as race_laps
 from {{ ref('stg_results') }} as results
 left join {{ ref('stg_races') }} as races
