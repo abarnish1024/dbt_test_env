@@ -6,6 +6,7 @@ on:
 
 jobs:
   cleanup:
+    if: github.event.pull_request.merged == false
     runs-on: ubuntu-latest
     permissions:
       contents: read

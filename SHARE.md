@@ -10,13 +10,11 @@ Reference implementation:
 
 1. Open a dbt PR.
 2. GitHub Actions builds into a temporary warehouse schema (`dbt_pr_<PR>`).
-3. CI creates a matching Omni dbt environment (`ci-pr-<PR>`) and an Omni **model branch** named after the git branch.
-4. CI rewrites Omni views onto that schema. Omni’s dbt-sync still compiles `main`, so a schema refresh alone will not pick up renamed columns.
+3. CI creates Omni dbt env `ci-pr-<PR>` and a **new Omni model branch** `pr-<N>` (not the dbt git branch name, and not reused across PRs).
+4. Hard-refresh first so Omni sees `dbt_pr_<N>`, then dbt-sync. Physical `main__` views are rewritten onto `dbt_pr_<N>` for preview only — dashboards use those views, not `omni_dbt__`.
 5. Content Validator comments on the dbt PR with broken dashboards.
-6. Optional `omni-autofix` label: 1:1 column renames are find/replaced on the Omni branch, and a PR is opened on the **Omni model git** repo.
-7. Merge **dbt first**. Prod `dbt build` writes the new columns, then CI merges the Omni git PR and `git/sync`s the shared model so dashboards do not stay dark.
-
-Use the **same branch name** in both repos.
+6. Optional `omni-autofix`: find/replace 1:1 renames, rewrite views back to `schema: main`, production dbt env, hard-refresh, Omni `git/commit` on git branch `pr-<N>`.
+7. Merge **dbt first**. Prod `dbt build`, then: views on `main` → prod env → hard refresh → commit → merge Omni git PR → merge Omni branch (`delete_branch: true`) → drop `ci-pr-<N>`. Do not call `/git/sync`.
 
 ## What to copy
 
@@ -27,8 +25,8 @@ Portable files from this repo:
 | ------------------------------------ | -------------------------------------------------- |
 | `scripts/omni_preview.py`            | Preview, autofix, cleanup, prod refresh            |
 | `.github/workflows/omni-preview.yml` | PR opened/updated/labeled                          |
-| `.github/workflows/omni-cleanup.yml` | PR closed: drop CI schema + Omni dbt env           |
-| `.github/workflows/dbt-prod.yml`     | `main` push: prod build + Omni promote             |
+| `.github/workflows/omni-cleanup.yml` | Abandoned PR only: drop CI schema + Omni dbt env |
+| `.github/workflows/dbt-prod.yml`     | `main` push: prod build, Omni promote, then cleanup |
 | `macros/generate_schema_name.sql`    | CI writes `DBT_SCHEMA`; prod stays the real schema |
 | `requirements.txt`                   | Swap the adapter if they are not DuckDB            |
 
@@ -70,6 +68,7 @@ Optional env (script defaults; set in workflows if they differ):
 | `OMNI_GIT_REPO`       | `abarnish1024/omni_test_env` | `org/their-omni-model-repo`                |
 | `OMNI_GIT_BASE`       | `main`                       | Omni git default branch                    |
 | `OMNI_PROD_SCHEMA`    | `main`                       | Their prod schema (`prod`, `analytics`, …) |
+| `OMNI_PROD_DBT_ENV_NAME` | `Production`              | Name of the default Omni dbt environment |
 | `MOTHERDUCK_DATABASE` | `my_db`                      | Their database name, or drop MotherDuck    |
 
 
@@ -117,18 +116,20 @@ If they use Snowflake, BigQuery, Redshift, Databricks, etc.:
 
 1. Feature branch. Never commit column renames straight to `main`.
 2. Open the dbt PR. Wait for the Omni preview comment (branch URL + validator).
-3. Optional: add the `omni-autofix` label. Ignore **git out of sync** on the preview branch. Do not open a second PR from the Omni git UI.
-4. Merge the **dbt** PR. Prod CI builds the warehouse, merges the Omni git PR, and syncs the shared model.
+3. Optional: add the `omni-autofix` label. Never commit `schema: dbt_pr_N` or while the Omni branch is on `ci-pr-<N>`. Do not open a second PR from the Omni git UI.
+4. Merge the **dbt** PR. Prod CI rewrites views to `main`, points `pr-<N>` at prod, commits, merges the Omni git PR, promotes and deletes that Omni branch, then drops the CI env.
 5. In Omni, analyze on the **shared model**, not a leftover feature branch.
 
-Do not merge the Omni git PR before prod has the new columns. CI does that after prod `dbt build`.
+Do not merge the Omni git PR before prod has the new columns. CI does that after prod `dbt build`. Do not call `POST /git/sync` when require-PRs is on — that only sets the out-of-sync banner.
 
 ## Gotchas
 
 - `OMNI_GIT_TOKEN` must be a GitHub PAT (`ghp_…`), not an Omni API key (`omni_osk_…`).
-- After autofix, the live Omni branch may still point at `dbt_pr_*` until prod refresh. “Git out of sync” on that branch is expected.
-- 1:1 column renames auto-heal. Grain or logic changes do not.
-- Omni branch names with slashes (`feat/foo`) must be URL-encoded on the merge API; the script does that.
+- Never Omni `git/commit` while a physical view has `schema: dbt_pr_N`, and never commit while the branch’s dbt environment is `ci-pr-<N>`. Both make CI schema a real active schema that rides into shared after cleanup.
+- Preview order is **hard-refresh, then dbt-sync**. Sync first matches against a schema model that has not seen `dbt_pr_N` yet and the env looks empty.
+- Omni model branch is `pr-<N>`, deleted on promote. Reusing `feat/foo` across dbt PRs flip-flops git.
+- Do not call `/git/sync` on this path. With require-PRs, it cannot write `main` and only flags the banner. If the banner shows anyway: Update PR from any branch, merge it, and the next git action reads in sync.
+- Cleanup must run **after** refresh-prod on merge.
 - If dashboards still query the old field after merge, you are probably on a leftover Omni feature branch — switch to the shared model.
 - Prod refresh needs the Omni **branch** that preview created. Always open dbt changes as a PR from a feature branch, not a commit on `main`.
 
